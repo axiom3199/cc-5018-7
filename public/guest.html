@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>远程嘉宾 · 音频上行</title>
+<link rel="stylesheet" href="/css/app.css" />
+</head>
+<body>
+<div class="shell">
+  <header class="topbar">
+    <div class="brand">
+      <h1>远程嘉宾 · 音频上行</h1>
+      <span class="sub">麦克风 / 测试音源 → Opus → 主持端</span>
+    </div>
+    <div class="links">
+      <a class="pill" href="/host">主持端页 →</a>
+      <span class="pill" id="pill-crypto"><span class="dot" id="dot-crypto"></span><span id="txt-crypto">安全上下文</span></span>
+      <span class="pill"><span class="dot" id="dot-ws"></span><span id="txt-ws">未连接</span></span>
+      <span class="pill"><span class="dot" id="dot-tx"></span><span id="txt-tx">未发送</span></span>
+    </div>
+  </header>
+
+  <div class="layout">
+    <main>
+      <section class="card">
+        <h2>来源与上线</h2>
+        <p class="hint">选择音源后点击「上线并开始发送」。麦克风需要浏览器授权；无麦克风或用无头浏览器测试时，可用持续音、脉冲或内置语音素材，它们同样经 Opus 编码后真实发送。</p>
+        <div id="banner" class="banner hidden"></div>
+        <div class="grid2">
+          <label class="field">会话名（需与主持端一致）
+            <input type="text" id="session-name" value="studio" />
+          </label>
+          <label class="field">音源
+            <select id="source">
+              <option value="tone">持续音 440 Hz</option>
+              <option value="pulse">脉冲 1 kHz（120/380 ms）</option>
+              <option value="speech">语音播报（内置素材，循环）</option>
+              <option value="mic">麦克风（需要授权）</option>
+            </select>
+          </label>
+        </div>
+        <div class="row" style="margin-top:12px">
+          <button id="btn-start" class="primary">上线并开始发送</button>
+          <button id="btn-stop" disabled>停止发送</button>
+          <button id="btn-reconnect" disabled>断线重连（新链路）</button>
+          <button id="btn-download" disabled>导出上行统计</button>
+          <div class="spacer"></div>
+          <span class="tag" id="tag-period">媒体期 —</span>
+          <span class="tag" id="tag-format">Opus 48 kHz</span>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>采集与编码</h2>
+        <p class="hint">采集在 AudioWorklet 的真实时钟上切成精确 960 样本块，再交给 WebCodecs 编码。以下数值来自内核，不是装饰。</p>
+        <div class="scope-wrap">
+          <canvas class="scope" id="meter"></canvas>
+          <div class="scope-label">上行电平（采集块峰值）</div>
+        </div>
+        <div class="sep"></div>
+        <div class="metrics">
+          <div class="metric"><div class="k">已采集帧</div><div class="v" id="m-captured">0</div></div>
+          <div class="metric"><div class="k">已编码包</div><div class="v" id="m-encoded">0</div></div>
+          <div class="metric"><div class="k">已发送包</div><div class="v" id="m-sent">0</div></div>
+          <div class="metric"><div class="k">上行字节</div><div class="v" id="m-bytes">0</div></div>
+          <div class="metric"><div class="k">编码错误</div><div class="v" id="m-enc-err">0</div></div>
+          <div class="metric"><div class="k">标记回传时延</div><div class="v" id="m-e2e">—</div></div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>真实网络损伤注入</h2>
+        <p class="hint">损伤作用于本机发送侧：延迟、抖动、丢包、乱序与重复在数据真正发出前发生，主持端看到的就是受损后的到达流。</p>
+        <div class="grid3">
+          <label class="field">模型
+            <select id="profile">
+              <option value="clean">干净链路</option>
+              <option value="steady" selected>稳定抖动</option>
+              <option value="bursty">突发抖动</option>
+              <option value="heavy">高抖动</option>
+              <option value="spike">延迟尖峰</option>
+              <option value="step">延迟阶跃</option>
+              <option value="drift">缓慢漂移</option>
+            </select>
+          </label>
+          <label class="field">基础延迟（ms）
+            <input type="number" id="base-ms" value="70" min="0" max="1000" step="5" />
+          </label>
+          <label class="field">抖动 σ（ms）
+            <input type="number" id="jitter-ms" value="12" min="0" max="300" step="1" />
+          </label>
+          <label class="field">丢包（%）
+            <input type="number" id="loss-pct" value="0.2" min="0" max="50" step="0.1" />
+          </label>
+          <label class="field">乱序（%）
+            <input type="number" id="reorder-pct" value="0.5" min="0" max="50" step="0.1" />
+          </label>
+          <label class="field">重复（%）
+            <input type="number" id="dup-pct" value="0" min="0" max="50" step="0.1" />
+          </label>
+        </div>
+        <div class="row" style="margin-top:12px">
+          <button id="btn-apply-net">应用损伤</button>
+          <button id="btn-clear-net">恢复干净链路</button>
+          <span class="tag" id="tag-impair">—</span>
+        </div>
+        <div class="sep"></div>
+        <div class="mini" id="feedback-status">主持端下发的控制会显示在这里。</div>
+      </section>
+
+      <section class="card">
+        <h2>时延标记</h2>
+        <p class="hint">标记随采集帧进入编码流。主持端测出该音频在缓冲中排队多久，再把结果回传，嘉宾端据此显示端到端估算（RTT/2 + 缓冲）。</p>
+        <div class="row">
+          <button id="btn-marker" disabled>发送时延标记</button>
+          <button id="btn-underrun-test" class="danger" disabled>请求主持端强制欠载</button>
+        </div>
+        <div class="sep"></div>
+        <div class="log" id="event-log">尚未上线。</div>
+      </section>
+    </main>
+
+    <aside>
+      <section class="card">
+        <h2>自检</h2>
+        <div class="checklist">
+          <div class="check"><span class="mark" id="ck-isolation">·</span><span>跨源隔离</span></div>
+          <div class="check"><span class="mark" id="ck-enc">·</span><span>WebCodecs Opus 编码</span></div>
+          <div class="check"><span class="mark" id="ck-capture">·</span><span>采集 AudioWorklet</span></div>
+          <div class="check"><span class="mark" id="ck-ws">·</span><span>WebSocket 中继</span></div>
+          <div class="check"><span class="mark" id="ck-mic">·</span><span>麦克风权限</span></div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>说明</h2>
+        <p class="mini">
+          本页是真实上行端：采集 → Opus 编码 → 按序号打包 → 按注入模型延迟/丢弃/重排后经 WebSocket 发送。
+          主持端负责有界抖动缓冲、乱序/重复/丢包处理、缺口隐藏与漂移控制。
+          断线后重新上线即开始新的媒体期。
+        </p>
+        <div class="sep"></div>
+        <div class="mini" id="negotiation">协商信息：—</div>
+      </section>
+    </aside>
+  </div>
+</div>
+<script type="module" src="/js/guest.js"></script>
+</body>
+</html>

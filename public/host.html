@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>主持端 · 远程嘉宾音频连线</title>
+<link rel="stylesheet" href="/css/app.css" />
+</head>
+<body>
+<div class="shell">
+  <header class="topbar">
+    <div class="brand">
+      <h1>主持端 · 远程嘉宾音频连线</h1>
+      <span class="sub">Opus over WebSocket · 有界抖动缓冲 · 真实收发与监听</span>
+    </div>
+    <div class="links">
+      <a class="pill" href="/guest">远程嘉宾页 →</a>
+      <span class="pill" id="pill-crypto"><span class="dot" id="dot-crypto"></span><span id="txt-crypto">安全上下文</span></span>
+      <span class="pill"><span class="dot" id="dot-ws"></span><span id="txt-ws">未连接</span></span>
+      <span class="pill"><span class="dot" id="dot-peer"></span><span id="txt-peer">等待嘉宾</span></span>
+    </div>
+  </header>
+
+  <div class="layout">
+    <main>
+      <section class="card">
+        <h2>连线与媒体期</h2>
+        <p class="hint">主持端只负责接收与播放。嘉宾断线后，会话保留；嘉宾重新进入即开始新的媒体期，缓冲重新对齐，不会把两段音频拼接到错误的时间位置。</p>
+        <div id="banner" class="banner hidden"></div>
+        <div class="row">
+          <button id="btn-connect" class="primary">建立接收连接</button>
+          <button id="btn-disconnect" disabled>断开</button>
+          <button id="btn-marker" disabled>发送时延标记</button>
+          <button id="btn-resync" disabled>重置媒体期</button>
+          <button id="btn-monitor" class="toggle" disabled>监听：关</button>
+          <div class="spacer"></div>
+          <span class="tag" id="tag-period">媒体期 —</span>
+          <span class="tag" id="tag-negotiation">—</span>
+        </div>
+        <div class="sep"></div>
+        <div class="grid3">
+          <label class="field">会话名
+            <input type="text" id="session-name" value="studio" />
+          </label>
+          <label class="field">声卡时钟偏差（ppm，模拟真实设备偏差）
+            <div class="row tight">
+              <input type="range" id="skew-range" min="-5000" max="5000" step="50" value="0" />
+              <span class="value" id="skew-value">0 ppm</span>
+            </div>
+          </label>
+          <label class="field">自动目标偏置（瞬时手调，仍受 400 ms 上限约束）
+            <div class="row tight">
+              <input type="range" id="bias-range" min="-60" max="200" step="5" value="0" />
+              <span class="value" id="bias-value">0 ms</span>
+            </div>
+          </label>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>缓冲水位与实际播放位置</h2>
+        <p class="hint">蓝色为当前队列深度（已解码待播样本），橙色刻度为目标水位。播放位置来自 AudioWorklet 的真实读指针，不是模拟曲线。</p>
+
+        <div class="bar" id="queue-bar">
+          <div class="fill" id="queue-fill"></div>
+          <div class="target" id="queue-target"></div>
+          <div class="caption">
+            <span>队列 <span id="queue-depth">0</span> ms</span>
+            <span>目标 <span id="queue-target-ms">120</span> ms</span>
+          </div>
+        </div>
+
+        <div class="sep"></div>
+        <div class="scope-wrap">
+          <canvas class="scope" id="scope"></canvas>
+          <div class="scope-label">播放输出波形（取自声卡实际送出样本）</div>
+        </div>
+
+        <div class="sep"></div>
+        <div class="metrics">
+          <div class="metric"><div class="k">已播放位置</div><div class="v" id="m-played">0</div></div>
+          <div class="metric"><div class="k">队列深度</div><div class="v" id="m-queue">0<small> ms</small></div></div>
+          <div class="metric"><div class="k">目标水位</div><div class="v" id="m-target">120<small> ms</small></div></div>
+          <div class="metric"><div class="k">网络抖动 EWMA</div><div class="v" id="m-jitter">0<small> ms</small></div></div>
+          <div class="metric"><div class="k">缓冲时延（标记）</div><div class="v" id="m-latency">—</div></div>
+          <div class="metric"><div class="k">欠载 / 缺口</div><div class="v" id="m-underruns">0 / 0</div></div>
+        </div>
+        <div class="sep"></div>
+        <canvas class="timeline" id="timeline"></canvas>
+        <div class="mini" style="margin-top:6px">近 60 秒：队列深度（蓝）、目标水位（橙）、抖动估计（灰）。</div>
+      </section>
+
+      <section class="card">
+        <h2>测试与统计</h2>
+        <p class="hint">在页内做离线注入测试会运行与实时链路相同的抖动缓冲类；也可让嘉宾端注入真实网络损伤，或在真实链路上打标记测时延。</p>
+        <div class="row">
+          <button id="btn-pulse-test" class="good">脉冲 / 语音 / 持续音测试</button>
+          <button id="btn-sim" >注入抖动模型并统计</button>
+          <button id="btn-report">导出统计 JSON</button>
+          <button id="btn-force-underrun" class="danger" disabled>强制一次欠载</button>
+        </div>
+        <div class="sep"></div>
+        <div class="grid2">
+          <div>
+            <label class="field">离线抖动模型
+              <select id="sim-profile">
+                <option value="clean">干净链路</option>
+                <option value="steady">稳定抖动</option>
+                <option value="bursty">突发抖动</option>
+                <option value="heavy">高抖动</option>
+                <option value="spike">延迟尖峰</option>
+                <option value="step">延迟阶跃</option>
+                <option value="drift">缓慢漂移</option>
+              </select>
+            </label>
+          </div>
+          <div>
+            <label class="field">模拟时长（秒）
+              <input type="number" id="sim-seconds" min="10" max="600" step="10" value="60" />
+            </label>
+          </div>
+        </div>
+        <div id="sim-summary" class="mini" style="margin-top:10px">尚未运行模拟。</div>
+        <div class="sep"></div>
+        <table class="data" id="stats-table">
+          <tbody>
+            <tr><th>媒体包</th><td id="s-packets">0</td><th>解码帧</th><td id="s-frames">0</td></tr>
+            <tr><th>乱序 / 重复</th><td id="s-reorder">0 / 0</td><th>晚到</th><td id="s-late">0</td></tr>
+            <tr><th>缺口次数</th><td id="s-gaps">0</td><th>隐藏样本</th><td id="s-conceal">0</td></tr>
+            <tr><th>媒体期重建</th><td id="s-resync">0</td><th>漂移比例</th><td id="s-drift">1.000</td></tr>
+            <tr><th>编码错误</th><td id="s-enc-err">0</td><th>解码错误</th><td id="s-dec-err">0</td></tr>
+            <tr><th>接收字节</th><td id="s-bytes">0</td><th>发送字节</th><td id="s-sent">0</td></tr>
+          </tbody>
+        </table>
+        <div class="sep"></div>
+        <div class="log" id="event-log">等待连接…</div>
+      </section>
+    </main>
+
+    <aside>
+      <section class="card">
+        <h2>监听与远程控制</h2>
+        <p class="hint">这些控件由远程音频内核驱动：抖动偏置、声卡偏差、来源与码率变化都会真实改变发送/接收行为，失败会回传到远程音频端。</p>
+        <label class="field">嘉宾来源（通过反馈下发）
+          <select id="remote-source">
+            <option value="tone">持续音 440 Hz</option>
+            <option value="pulse">脉冲 1 kHz</option>
+            <option value="speech">语音播报</option>
+          </select>
+        </label>
+        <div class="sep"></div>
+        <label class="field">Opus 码率
+          <div class="row tight">
+            <input type="range" id="bitrate-range" min="16000" max="128000" step="8000" value="64000" />
+            <span class="value" id="bitrate-value">64 kbps</span>
+          </div>
+        </label>
+        <div class="sep"></div>
+        <label class="field">远程网络注入（反馈至嘉宾端真实生效）
+          <select id="remote-profile">
+            <option value="clean">干净链路</option>
+            <option value="steady" selected>稳定抖动</option>
+            <option value="bursty">突发抖动</option>
+            <option value="heavy">高抖动</option>
+            <option value="spike">延迟尖峰</option>
+            <option value="step">延迟阶跃</option>
+            <option value="drift">缓慢漂移</option>
+          </select>
+        </label>
+        <div class="row" style="margin-top:10px">
+          <button id="btn-apply-profile" class="primary">下发到嘉宾端</button>
+          <button id="btn-request-marker">请求远程标记</button>
+        </div>
+        <div id="feedback-status" class="mini" style="margin-top:10px">尚未下发反馈。</div>
+      </section>
+
+      <section class="card">
+        <h2>自检</h2>
+        <p class="hint">真实浏览器能力与链路状态。</p>
+        <div class="checklist" id="checklist">
+          <div class="check"><span class="mark" id="ck-isolation">·</span><span>跨源隔离（SharedArrayBuffer）</span></div>
+          <div class="check"><span class="mark" id="ck-codecs">·</span><span>WebCodecs Opus 编/解码</span></div>
+          <div class="check"><span class="mark" id="ck-worklet">·</span><span>AudioWorklet 播放线程</span></div>
+          <div class="check"><span class="mark" id="ck-ws">·</span><span>WebSocket 中继</span></div>
+          <div class="check"><span class="mark" id="ck-play">·</span><span>播放已启动</span></div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>标记与结果</h2>
+        <div class="metrics">
+          <div class="metric"><div class="k">标记测得</div><div class="v" id="m-markers">0</div></div>
+          <div class="metric"><div class="k">平均缓冲时延</div><div class="v" id="m-avg-latency">—</div></div>
+          <div class="metric"><div class="k">最大缓冲时延</div><div class="v" id="m-max-latency">—</div></div>
+        </div>
+        <div class="sep"></div>
+        <div class="mini" id="result-summary">尚未测得结果。连接后点击「发送时延标记」。</div>
+      </section>
+    </aside>
+  </div>
+</div>
+<script type="module" src="/js/host.js"></script>
+</body>
+</html>

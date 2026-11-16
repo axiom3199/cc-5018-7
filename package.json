@@ -1,0 +1,20 @@
+{
+  "name": "remote-audio-link",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Broadcast remote-guest audio link prototype: real Opus over WebSocket, bounded jitter buffer, AudioWorklet playout, host studio page.",
+  "type": "module",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node server/index.js",
+    "test": "node --test test/unit.test.js",
+    "test:e2e": "node test/e2e.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "playwright": "^1.49.1"
+  }
+}
