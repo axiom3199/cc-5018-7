@@ -162,6 +162,33 @@ async function main() {
   const deltaRead = p2.read - p1.read;
   check('playback advances at ~48 kHz', deltaRead > 38000 && deltaRead < 58000, `${deltaRead} samples/s`);
 
+  console.log('\n== host buffer-level control (target bias) ==');
+  // The streaming-control page must drive the real buffer computation: moving
+  // the bias slider changes the kernel's target by the requested amount.
+  const biasBase = await readHostDom(host);
+  await host.evaluate(() => {
+    const r = document.getElementById('bias-range');
+    r.value = '120';
+    r.dispatchEvent(new Event('input'));
+  });
+  await sleep(500);
+  const biased = await readHostDom(host);
+  check(
+    'target bias raises the buffer target by the requested amount',
+    biased.targetMs >= biasBase.targetMs + 60 && biased.targetMs <= 400,
+    `${biasBase.targetMs} -> ${biased.targetMs} ms`,
+  );
+  await host.evaluate(() => {
+    const r = document.getElementById('bias-range');
+    r.value = '0';
+    r.dispatchEvent(new Event('input'));
+  });
+  await host.click('#btn-monitor'); // listen off
+  await sleep(200);
+  await host.click('#btn-monitor'); // listen on
+  await sleep(200);
+  check('monitor toggle keeps the link healthy', hostErrors.length === 0, hostErrors.slice(0, 2).join(' | '));
+
   console.log('\n== jitter injection (bursty) ==');
   await guest.selectOption('#profile', 'bursty');
   await sleep(200);
@@ -170,10 +197,10 @@ async function main() {
   const afterB = await readHostDom(host);
   check('bursty profile keeps playing', afterB.playing, `underruns=${afterB.underruns}`);
   check('bursty profile target stays bounded', afterB.targetMs <= 400, `${afterB.targetMs} ms`);
-  check('bursty profile target did not grow without bound', afterB.targetMs <= 400, `${afterB.targetMs} ms`);
+  check('bursty profile queue stays below the hard cap', afterB.queueMs <= 1200, `${afterB.queueMs} ms`);
   check(
     'bursty profile processed reordering/duplicates',
-    afterB.reordered + afterB.duplicates >= 0,
+    afterB.reordered + afterB.duplicates > 0,
     `reordered=${afterB.reordered} duplicates=${afterB.duplicates} gaps=${afterB.gaps}`,
   );
   check('no host page errors after impairment', hostErrors.length === 0, hostErrors.slice(0, 2).join(' | '));
@@ -184,7 +211,7 @@ async function main() {
   await sleep(7000);
   const afterH = await readHostDom(host);
   check('heavy profile target bounded by 400 ms', afterH.targetMs <= 400, `${afterH.targetMs} ms`);
-  check('heavy profile concealed some audio explicitly', afterH.concealed >= 0, `${afterH.concealed} samples`);
+  check('heavy profile concealed some audio explicitly', afterH.concealed > 0, `${afterH.concealed} samples`);
   check('heavy profile still advancing', afterH.frames > afterB.frames, `${afterB.frames} -> ${afterH.frames}`);
 
   console.log('\n== deterministic loss window: concealment lands in the hole ==');
@@ -205,8 +232,64 @@ async function main() {
   check('loss run reported gaps', lossAfter.gaps > lossBefore.gaps, `${lossBefore.gaps} -> ${lossAfter.gaps}`);
   check('loss run kept playing', lossAfter.frames > lossBefore.frames, `${lossBefore.frames} -> ${lossAfter.frames}`);
   check('loss run target bounded', lossAfter.targetMs <= 400, `${lossAfter.targetMs} ms`);
-  check('loss run did not conceal more than was sent', lossAfter.concealed < lossAfter.frames + lossAfter.concealed + 1, `concealed=${lossAfter.concealed}`);
+  // Concealment must be exact: every gap event hides 1..MAX_GAP_FRAMES frames
+  // (960 samples each), never zero, never unbounded.
+  check(
+    'concealed samples match gap spans exactly',
+    lossAfter.concealed >= lossAfter.gaps * 960 && lossAfter.concealed <= lossAfter.gaps * 25 * 960,
+    `concealed=${lossAfter.concealed} gaps=${lossAfter.gaps}`,
+  );
   await guest.click('#btn-clear-net');
+
+  console.log('\n== u32 sequence wraparound on the live link ==');
+  // Jump the guest's send sequence close to the u32 wrap, then reset the host
+  // receive path so the artificial jump itself starts a fresh media period.
+  // What is under test is the wrap crossing (0xffffffff -> 0) on the real
+  // encode -> wire -> gate -> decode -> playout path.
+  await guest.evaluate(() => window.__guestControl('set-next-seq', { seq: 0xffffff00 }));
+  await host.click('#btn-resync');
+  await sleep(1800);
+  const wrapBase = await host.evaluate(() => {
+    const s = window.__hostStats();
+    return { seq: s.lastWireSeq >>> 0, gaps: s.gaps, late: s.late, resyncs: s.resyncs, frames: s.framesDecoded };
+  });
+  check('wrap: stream re-established near the top of the u32 space', wrapBase.seq >= 0xffffff00, `seq=0x${wrapBase.seq.toString(16)}`);
+  let wrapped = false;
+  for (let i = 0; i < 100 && !wrapped; i++) {
+    const s = await host.evaluate(() => window.__hostStats().lastWireSeq >>> 0);
+    if (s < 0xffffff00) wrapped = true;
+    else await sleep(150);
+  }
+  check('wrap: wire sequence crossed the u32 boundary', wrapped);
+  await sleep(1200);
+  const wrapAfter = await host.evaluate(() => {
+    const s = window.__hostStats();
+    return { seq: s.lastWireSeq >>> 0, gaps: s.gaps, late: s.late, resyncs: s.resyncs, frames: s.framesDecoded };
+  });
+  // Evidence for the wrap window: every timeline-affecting kernel event,
+  // printed whether or not the checks fail.
+  const wrapEvents = await host.evaluate(() =>
+    (window.__hostStats().eventLog || []).filter((e) =>
+      ['gate-gap', 'conceal', 'drop-overlap', 'rebase', 'gate-resync', 'late-packet', 'decode-overflow'].includes(e.kind),
+    ),
+  );
+  console.log(`  [evidence] timeline events in the wrap window: ${JSON.stringify(wrapEvents.slice(-10))}`);
+  check('wrap: decoding continued across the boundary', wrapAfter.frames > wrapBase.frames + 30, `${wrapBase.frames} -> ${wrapAfter.frames}`);
+  check('wrap: no resync triggered by the wrap', wrapAfter.resyncs === wrapBase.resyncs, `${wrapBase.resyncs} -> ${wrapAfter.resyncs}`);
+  // The boundary itself must be invisible to the timeline: no gap event and
+  // no late condemnation carrying a sequence number at the wrap. A broken
+  // modular comparison misjudges the first packets at the crossing, so the
+  // zone is +/-16 frames around 0xffffffff -> 0. Events farther out are
+  // environmental (>70 ms scheduling stalls on the clean link, same
+  // signature as the mid-stream stalls printed above), not wrap artifacts.
+  const boundaryEvents = wrapEvents.filter((e) => {
+    const seq = e.detail?.startSeq ?? e.detail?.seq;
+    return typeof seq === 'number' && (seq >= 0xfffffff0 || seq <= 0x0f);
+  });
+  check('wrap: no gap or late packet at the sequence boundary', boundaryEvents.length === 0, JSON.stringify(boundaryEvents));
+  const wrapMon = await readMonitorSample(host, 4096);
+  const wrapRms = wrapMon ? Math.sqrt(wrapMon.reduce((a, v) => a + v * v, 0) / wrapMon.length) : 0;
+  check('wrap: playout stayed non-silent across the wrap', wrapRms > 0.005, `rms=${wrapRms.toFixed(4)}`);
 
   console.log('\n== disconnect and new media period ==');
   const periodBefore = await host.textContent('#tag-period');

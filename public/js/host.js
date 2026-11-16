@@ -127,6 +127,8 @@ async function connect() {
       monWrite: Atomics.load(ctrl, SAB.MON_WRITE),
       underruns: Atomics.load(ctrl, SAB.UNDERRUNS),
     });
+    // Read-only kernel stats probe for the end-to-end timing regression.
+    window.__hostStats = () => client?.stats ?? {};
 
     client = new RemoteAudioClient({ onEvent });
     await client.init('host', {

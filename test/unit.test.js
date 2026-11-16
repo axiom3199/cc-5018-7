@@ -1,14 +1,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { JITTER } from '../public/js/protocol.js';
+import { JITTER, FRAME_SAMPLES } from '../public/js/protocol.js';
 import {
   ArrivalTracker,
   TargetController,
   PacketGate,
+  PlayoutTimeline,
   DriftController,
   resampleFrame,
   concealmentSpan,
   classifyPlacement,
+  seqForwardDistance,
 } from '../public/js/dsp.js';
 import { NetworkImpairment, DeliveryQueue, mulberry32 } from '../public/js/network.js';
 
@@ -77,7 +79,7 @@ test('arrival tracker EWMA reacts to sustained jitter and follows low-water mark
 test('reorder gate emits exact gap spans and never moves next packet into hole', () => {
   const gate = new PacketGate({ ...JITTER, REPAIR_WAIT_MS: 70, MAX_GAP_FRAMES: 25 });
   let events = gate.push(0, 'f0', 0);
-  assert.deepEqual(events, [{ type: 'frame', seq: 0, item: 'f0' }]);
+  assert.deepEqual(events, [{ type: 'frame', seq: 0, unwrappedSeq: 0, item: 'f0' }]);
   // 1 and 2 are lost; 3 arrives and must wait behind the hole.
   events = gate.push(3, 'f3', 25);
   assert.equal(events.length, 0, 'frame behind a hole is held');
@@ -289,4 +291,231 @@ test('target never exceeds MAX_MS even when jitter estimate is absurd', () => {
     assert.ok(ctl.targetMs <= JITTER.MAX_MS);
   }
   assert.equal(ctl.targetMs, JITTER.MAX_MS);
+});
+
+// ---------------------------------------------------------------------------
+// Boundary reproductions: u32 sequence wraparound and packets crossing the
+// repair deadline exactly. These started as minimal reproducers for stalls
+// and misclassified packets at the wrap; they now pin the modular sequence
+// arithmetic and the output-advance relation.
+// ---------------------------------------------------------------------------
+test('sequence math: forward distance is modular over the u32 wire space', () => {
+  assert.equal(seqForwardDistance(0xfffffffe, 0), 2);
+  assert.equal(seqForwardDistance(0xffffffff, 0xffffffff), 0);
+  assert.equal(seqForwardDistance(0, 0xffffffff), 0xffffffff);
+  assert.equal(seqForwardDistance(100, 0), 0xffffff9c);
+  assert.equal(seqForwardDistance(5, 5 + 25), 25);
+});
+
+test('sequence wraparound: gate keeps delivering across the u32 boundary', () => {
+  const gate = new PacketGate();
+  const seqs = [0xfffffffc, 0xfffffffd, 0xfffffffe, 0xffffffff, 0, 1, 2];
+  const delivered = [];
+  seqs.forEach((seq, i) => {
+    for (const ev of gate.push(seq, `f${seq}`, i * 20)) {
+      if (ev.type === 'frame') delivered.push(ev.seq);
+    }
+  });
+  // Every packet is eligible after the wrap; none is "late".
+  assert.deepEqual(delivered, seqs);
+  assert.equal(gate.stats.late, 0);
+  assert.equal(gate.stats.gaps, 0);
+});
+
+test('sequence wraparound with a hole at the boundary emits a sane gap and recovers', () => {
+  const gate = new PacketGate({ ...JITTER, REPAIR_WAIT_MS: 70, MAX_GAP_FRAMES: 25 });
+  gate.push(0xfffffffd, 'a', 0); // delivered, cursor at 0xfffffffe
+  gate.push(0xffffffff, 'c', 10); // one hole (0xfffffffe), held
+  const held = gate.push(0, 'd', 20); // two ahead across the wrap: held, not "late"
+  assert.equal(held.length, 0);
+  assert.equal(gate.stats.late, 0, 'post-wrap packet must not be condemned as late');
+  const events = gate.poll(100); // repair wait for the hole expires
+  const gap = events.find((e) => e.type === 'gap');
+  assert.ok(gap, 'a gap event is expected');
+  assert.equal(gap.startSeq, 0xfffffffe);
+  assert.equal(gap.count, 1, 'the hole is exactly one frame, not a negative or huge span');
+  const frames = events.filter((e) => e.type === 'frame').map((e) => e.seq);
+  assert.deepEqual(frames, [0xffffffff, 0], 'queued frames drain in wire order across the wrap');
+  assert.equal(gate.stats.gapFrames, 1);
+  const more = gate.push(1, 'e', 120);
+  assert.deepEqual(
+    more.filter((e) => e.type === 'frame').map((e) => e.seq),
+    [1],
+    'stream continues after the wrap',
+  );
+});
+
+test('frame events carry a monotonic unwrapped sequence across wrap and resync', () => {
+  const gate = new PacketGate({ ...JITTER, REPAIR_WAIT_MS: 10, MAX_GAP_FRAMES: 5 });
+  const seen = [];
+  const resyncs = [];
+  const feed = (seq, t) => {
+    for (const ev of gate.push(seq, null, t)) {
+      if (ev.type === 'frame') seen.push([ev.seq, ev.unwrappedSeq]);
+      if (ev.type === 'resync') resyncs.push(ev);
+    }
+  };
+  feed(0xfffffffe, 0);
+  feed(0xffffffff, 10);
+  feed(0, 20);
+  feed(1, 30);
+  assert.deepEqual(
+    seen.map(([, u]) => u),
+    [0xfffffffe, 0xffffffff, 0x100000000, 0x100000001],
+    'media positions must not wrap: the playout timeline stays monotonic',
+  );
+  // A forward discontinuity resyncs and the unwrapped position jumps with it,
+  // so the playout side still sees the gap as a media-period change.
+  feed(0x1000, 40);
+  feed(0x1001, 50);
+  assert.equal(resyncs.length, 1);
+  assert.equal(resyncs[0].fromSeq, 2);
+  assert.equal(resyncs[0].toSeq, 0x1000);
+  const jump = seen[seen.length - 2][1] - seen[seen.length - 3][1];
+  assert.equal(jump, 0x1000 - 1, 'resync advances the timeline by the skipped span');
+  assert.equal(seen[seen.length - 1][1] - seen[seen.length - 2][1], 1);
+});
+
+test('deadline boundary: a packet pushed exactly at the repair deadline still fills the hole', () => {
+  const gate = new PacketGate({ ...JITTER, REPAIR_WAIT_MS: 70, MAX_GAP_FRAMES: 25 });
+  gate.push(0, 'f0', 0);
+  gate.push(2, 'f2', 10); // hole at 1, wait starts at 10
+  // Arrives exactly at waitStart + REPAIR_WAIT_MS. Pushed packets always get
+  // their chance: the deadline only governs giving up, never refuses arrivals.
+  const events = gate.push(1, 'f1', 80);
+  assert.deepEqual(
+    events.map((e) => [e.type, e.seq]),
+    [
+      ['frame', 1],
+      ['frame', 2],
+    ],
+  );
+  assert.equal(gate.stats.gaps, 0);
+  assert.equal(gate.stats.late, 0);
+});
+
+test('deadline boundary: poll at exactly the deadline gives up; the late copy is dropped once', () => {
+  const gate = new PacketGate({ ...JITTER, REPAIR_WAIT_MS: 70, MAX_GAP_FRAMES: 25 });
+  gate.push(0, 'f0', 0);
+  gate.push(2, 'f2', 10); // hole at 1
+  const events = gate.poll(80); // waited exactly REPAIR_WAIT_MS
+  assert.deepEqual(
+    events.map((e) => e.type),
+    ['gap', 'frame'],
+  );
+  assert.equal(events[0].startSeq, 1);
+  assert.equal(events[0].count, 1);
+  // The first copy arrives after its span was concealed: dropped as late,
+  // counted exactly once, and never re-emitted (no duplicate samples later).
+  const late = gate.push(1, 'f1-late', 90);
+  assert.equal(late.length, 0);
+  assert.equal(gate.stats.late, 1);
+  assert.equal(gate.stats.duplicates, 0);
+  // A re-send of an already-played packet is a duplicate, not "late".
+  gate.push(0, 'f0-dup', 95);
+  assert.equal(gate.stats.duplicates, 1);
+  assert.equal(gate.stats.late, 1);
+});
+
+// Minimal model of the kernel's receive path: gate events feed timeline
+// placement; the output is the exact sequence of sample spans appended to the
+// playout ring. This is the harness that maps output sample order and gaps to
+// executable evidence.
+function makeOutputModel() {
+  const timeline = new PlayoutTimeline(JITTER.MAX_GAP_FRAMES);
+  const spans = [];
+  return {
+    spans,
+    accept(ev) {
+      assert.equal(
+        typeof ev.unwrappedSeq,
+        'number',
+        'frame events must carry an unwrapped media sequence',
+      );
+      const pcm = new Float32Array(FRAME_SAMPLES).fill(0.01 * (ev.seq % 97));
+      const r = timeline.accept(ev.unwrappedSeq * FRAME_SAMPLES, pcm);
+      if (r.mode === 'conceal') {
+        spans.push({ kind: 'conceal', frames: r.concealFrames, at: r.at - r.concealFrames * FRAME_SAMPLES });
+      }
+      if (r.mode === 'epoch' || r.mode === 'place' || r.mode === 'conceal') {
+        spans.push({ kind: 'frame', seq: ev.seq, at: r.at });
+      }
+      return r;
+    },
+  };
+}
+
+test('output sample order: wrap, loss and late arrivals never duplicate or shift samples', () => {
+  const gate = new PacketGate({ ...JITTER, REPAIR_WAIT_MS: 70, MAX_GAP_FRAMES: 25 });
+  const out = makeOutputModel();
+  const pump = (seq, t) => {
+    for (const ev of gate.push(seq, seq, t)) if (ev.type === 'frame') out.accept(ev);
+  };
+  const poll = (t) => {
+    for (const ev of gate.poll(t)) if (ev.type === 'frame') out.accept(ev);
+  };
+
+  pump(0xfffffffc, 0);
+  pump(0xfffffffd, 20);
+  pump(0xfffffffe, 40);
+  pump(0, 60); // belongs after 0xffffffff, which is lost; held behind the hole
+  pump(1, 80);
+  poll(140); // repair deadline for the hole at 0xffffffff
+  pump(2, 160);
+  pump(0xffffffff, 180); // the lost packet, far too late: gate must drop it
+  pump(3, 200);
+
+  const kinds = out.spans.map((s) => s.kind);
+  assert.deepEqual(kinds, [
+    'frame', // 0xfffffffc (epoch)
+    'frame', // 0xfffffffd
+    'frame', // 0xfffffffe
+    'conceal', // exactly one frame for the lost 0xffffffff
+    'frame', // 0
+    'frame', // 1
+    'frame', // 2
+    'frame', // 3
+  ]);
+  const conceal = out.spans.find((s) => s.kind === 'conceal');
+  assert.equal(conceal.frames, 1, 'the hole is concealed for exactly its own span');
+
+  // Output positions are strictly contiguous: each span starts where the
+  // previous one ended. No overlap (duplicate samples) and no unaccounted
+  // hole (silence that was never concealed).
+  let expect = 0xfffffffc * FRAME_SAMPLES;
+  for (const s of out.spans) {
+    assert.equal(s.at, expect, `span ${s.kind} seq=${s.seq ?? ''} misplaced`);
+    expect += (s.kind === 'conceal' ? s.frames : 1) * FRAME_SAMPLES;
+  }
+  assert.equal(gate.stats.late, 1, 'only the resurrected packet is late');
+  assert.equal(gate.stats.duplicates, 0);
+});
+
+test('concealment fades from the frame that actually preceded the hole', () => {
+  const timeline = new PlayoutTimeline(JITTER.MAX_GAP_FRAMES);
+  const before = new Float32Array(FRAME_SAMPLES).fill(0.5);
+  const after = new Float32Array(FRAME_SAMPLES).fill(-0.9);
+  timeline.accept(1000 * FRAME_SAMPLES, before); // played just before the hole
+  const r = timeline.accept(1003 * FRAME_SAMPLES, after); // 2-frame hole
+  assert.equal(r.mode, 'conceal');
+  assert.equal(r.concealFrames, 2);
+  // The fade must start from the last sample of the pre-hole frame (0.5),
+  // never from the post-hole frame (-0.9): compensation comes from the audio
+  // that was actually played, not from the future.
+  assert.ok(Math.abs(r.concealPcm[0] - 0.5 * (1 - 1 / FRAME_SAMPLES)) < 1e-7);
+  assert.ok(Math.abs(r.concealPcm[0] - -0.9 * (1 - 1 / FRAME_SAMPLES)) > 0.1);
+});
+
+test('placement timeline: dropped frames never become the concealment source', () => {
+  const timeline = new PlayoutTimeline(JITTER.MAX_GAP_FRAMES);
+  const good = new Float32Array(FRAME_SAMPLES).fill(0.25);
+  timeline.accept(0, good);
+  // A duplicate/overlapping frame arrives and is dropped: it was never played,
+  // so it must not become the reference for later concealment.
+  const dup = new Float32Array(FRAME_SAMPLES).fill(0.99);
+  const d = timeline.accept(0, dup);
+  assert.equal(d.mode, 'drop');
+  const r = timeline.accept(2 * FRAME_SAMPLES, new Float32Array(FRAME_SAMPLES).fill(0.1));
+  assert.equal(r.mode, 'conceal');
+  assert.ok(Math.abs(r.concealPcm[0] - 0.25 * (1 - 1 / FRAME_SAMPLES)) < 1e-7);
 });

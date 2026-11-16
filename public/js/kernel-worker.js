@@ -33,10 +33,9 @@ import {
   ArrivalTracker,
   TargetController,
   PacketGate,
+  PlayoutTimeline,
   DriftController,
   resampleFrame,
-  concealmentSpan,
-  classifyPlacement,
 } from '/js/dsp.js';
 import { NetworkImpairment, DeliveryQueue } from '/js/network.js';
 
@@ -114,13 +113,11 @@ let gate = null;
 let arrivals = null;
 let targets = null;
 let drift = null;
-let lastPcm = null;
 
-// Timeline cursor, in media samples (not ring samples). This is the key
-// invariant that keeps loss concealment from stealing the next packet's
-// position: a decoded frame is placed according to its own media timestamp.
-let mediaCursorSamples = null;
-let lastDecodedSeq = -1;
+// Timeline placement (media cursor + concealment source) lives in one pure
+// object so the unit tests drive the exact same output-advance logic.
+let timeline = null;
+let placementDrops = 0;
 const decodeFifo = [];
 
 let paused = false;
@@ -287,7 +284,9 @@ function onEncoded(chunk) {
     seqToSampleStart.delete(seq);
     wsSendJson({
       type: MSG.MARKER,
-      seq,
+      // The host matches markers against the wire sequence number, so send
+      // the same u32 the media packet carries, not the unwrapped counter.
+      seq: seq >>> 0,
       mediaStartUs,
       wallEpochMs: performance.timeOrigin + performance.now(),
       markerId: markerInfo.markerId,
@@ -343,6 +342,8 @@ async function startHost(o) {
   arrivals = new ArrivalTracker();
   targets = new TargetController();
   drift = new DriftController();
+  timeline = new PlayoutTimeline();
+  placementDrops = 0;
 
   Atomics.store(ctrl, SAB.WRITE_SAMPLE, 0);
   Atomics.store(ctrl, SAB.READ_SAMPLE, 0);
@@ -390,15 +391,23 @@ function onMedia(arrayBuffer) {
   }
   stats.packetsReceived++;
   stats.bytesReceived += arrayBuffer.byteLength;
+  stats.lastWireSeq = pkt.seq;
   const arrivalMs = performance.now();
   const obs = arrivals.observe(pkt.mediaStartUs, arrivalMs);
   stats.jitterMs = obs.jitterMs;
   stats.excessMs = obs.excessMs;
 
+  const lateBefore = gate.stats.late;
   const events = gate.push(pkt.seq, pkt, arrivalMs);
+  if (gate.stats.late > lateBefore) {
+    // A first-copy packet that missed its playout deadline. Logged with its
+    // sequence number so the event log (and the timing regression) can tell
+    // a genuinely late packet apart from a wrap or resync artefact.
+    logEvent('late-packet', { seq: pkt.seq });
+  }
   for (const ev of events) {
     if (ev.type === 'frame') {
-      decodePacket(ev.item);
+      decodePacket(ev.item, ev.unwrappedSeq);
     } else if (ev.type === 'gap') {
       // Do not count here: the decoder timestamps give the authoritative gap
       // size, and counting both places would double-report loss. This is
@@ -411,22 +420,25 @@ function onMedia(arrayBuffer) {
     }
   }
   stats.duplicates = gate.stats.duplicates;
-  stats.late = gate.stats.late;
+  stats.late = gate.stats.late + placementDrops;
   stats.reordered = gate.stats.reordered;
 }
 
-function decodePacket(pkt) {
+function decodePacket(pkt, unwrappedSeq) {
   if (decoder.state !== 'configured') return;
   if (decoder.decodeQueueSize > 50) {
     // Bounded decode: refuse to accumulate unbounded work. Counted as loss.
     stats.decodeErrors++;
+    logEvent('decode-overflow', { seq: pkt.seq, queued: decoder.decodeQueueSize });
     return;
   }
   // WebCodecs Opus output timestamps are an internal continuous count and do
   // NOT reflect skipped input timestamps (verified experimentally). The media
   // sequence number is therefore the only reliable timeline anchor; pair it
   // with the decoder output through a FIFO, because decode is asynchronous but
-  // strictly ordered.
+  // strictly ordered. The gate's unwrapped sequence keeps the anchor monotonic
+  // across the u32 wire wrap.
+  pkt.unwrappedSeq = unwrappedSeq;
   decodeFifo.push(pkt);
   if (decodeFifo.length > 200) decodeFifo.shift();
   decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: pkt.mediaStartUs, data: pkt.payload }));
@@ -439,48 +451,42 @@ function onDecoded(data) {
   data.copyTo(pcm, { planeIndex: 0, format: 'f32-planar' });
   data.close();
   stats.framesDecoded++;
-  lastPcm = pcm;
   stats.framesWritten++;
 
   // Match this decoded output to the packet that produced it. Sequence
   // numbers, not output timestamps, define the media timeline.
   const pkt = decodeFifo.shift();
   const seq = pkt ? pkt.seq : null;
-  const mediaSample = seq == null ? Math.round((tsUs / 1e6) * SAMPLE_RATE) : seq * FRAME_SAMPLES;
+  const mediaSample = pkt ? pkt.unwrappedSeq * FRAME_SAMPLES : Math.round((tsUs / 1e6) * SAMPLE_RATE);
 
-  if (mediaCursorSamples === null) {
-    mediaCursorSamples = mediaSample;
+  const r = timeline.accept(mediaSample, pcm);
+  if (r.mode === 'epoch') {
     logEvent('media-epoch', { seq, mediaSample });
-  }
-
-  const placement = classifyPlacement(mediaCursorSamples, mediaSample, frames, JITTER.MAX_GAP_FRAMES);
-  if (placement.mode === 'rebase') {
+  } else if (r.mode === 'rebase') {
     // Media discontinuity: never conceal hundreds of frames. Flush the ring
     // and resume at the new position; the silence is explicit and reported.
-    rebasePlayout(mediaSample, 'timestamp-jump', placement.deltaFrames);
+    rebasePlayout(mediaSample, 'timestamp-jump', r.deltaFrames);
     return;
-  }
-  if (placement.mode === 'drop') {
+  } else if (r.mode === 'drop') {
     // Overlapping/duplicate media: drop it rather than rewind the timeline.
-    logEvent('drop-overlap', { frames: placement.deltaFrames });
-    stats.late++;
+    logEvent('drop-overlap', { frames: r.deltaFrames });
+    placementDrops++;
+    stats.late = gate.stats.late + placementDrops;
     return;
-  }
-  if (placement.mode === 'conceal') {
-    // Explicit concealment exactly where the missing media belongs. The next
-    // frame is then written after it, at its own media position.
-    writeSpan(concealmentSpan(lastPcm, placement.deltaFrames, frames), placement.deltaFrames);
+  } else if (r.mode === 'conceal') {
+    // Explicit concealment exactly where the missing media belongs, built from
+    // the last frame that was actually played. The next frame is then written
+    // after it, at its own media position.
+    writeSpan(r.concealPcm, r.concealFrames);
     stats.gaps++;
-    stats.gapFrames += placement.deltaFrames;
-    stats.concealedSamples += placement.deltaFrames * FRAME_SAMPLES;
+    stats.gapFrames += r.concealFrames;
+    stats.concealedSamples += r.concealFrames * FRAME_SAMPLES;
     stats.lastRepairReason = gate?.stats.late ? 'late-arrival' : 'packet-loss';
-    logEvent('conceal', { frames: placement.deltaFrames, reason: stats.lastRepairReason });
-    mediaCursorSamples += placement.deltaFrames * FRAME_SAMPLES;
-    post('conceal', { frames: placement.deltaFrames, reason: stats.lastRepairReason });
+    logEvent('conceal', { frames: r.concealFrames, reason: stats.lastRepairReason });
+    post('conceal', { frames: r.concealFrames, reason: stats.lastRepairReason });
   }
 
   writeSpan(pcm, 1);
-  mediaCursorSamples += frames;
 
   const marker = seq == null ? null : pendingRemoteMarkers.get(seq);
   if (marker) {
@@ -524,8 +530,7 @@ function writeSpan(pcm, mediaFrames) {
 
 function rebasePlayout(mediaSample, reason, missingFrames) {
   generation++;
-  mediaCursorSamples = mediaSample;
-  lastPcm = null;
+  timeline.rebase(mediaSample);
   Atomics.store(ctrl, SAB.PLAYING, 0);
   Atomics.store(ctrl, SAB.COMMAND, SAB_COMMAND.FLUSH);
   paused = true;
@@ -564,7 +569,7 @@ function queueTick() {
   if (gate) {
     const events = gate.poll(now);
     for (const ev of events) {
-      if (ev.type === 'frame') decodePacket(ev.item);
+      if (ev.type === 'frame') decodePacket(ev.item, ev.unwrappedSeq);
       else if (ev.type === 'gap') logEvent('gate-gap', { startSeq: ev.startSeq, count: ev.count });
       else if (ev.type === 'resync') logEvent('gate-resync', { fromSeq: ev.fromSeq, toSeq: ev.toSeq });
     }
@@ -666,6 +671,11 @@ function onWsJson(msg) {
         if (stats.period == null || stats.period === 0) stats.period = msg.period;
         else if (msg.period !== stats.period) {
           stats.period = msg.period;
+          // A new media period is a new sequence space: the old gate would
+          // condemn every packet of a restarted sender as "late". Reset it so
+          // the new period's packets are eligible again.
+          gate = new PacketGate();
+          pendingRemoteMarkers.clear();
           rebasePlayout(null, 'new-period', 0);
         }
       }
@@ -727,7 +737,7 @@ function handleMarkerEcho(msg) {
 function handlePeriodEnd(reason) {
   if (mode !== 'host') return;
   paused = true;
-  mediaCursorSamples = null;
+  timeline.reset();
   Atomics.store(ctrl, SAB.PLAYING, 0);
   logEvent('period-end', { reason });
   post('period-end', { reason });
@@ -737,8 +747,7 @@ function resetReceive(reason) {
   if (!gate) return;
   gate = new PacketGate();
   pendingRemoteMarkers.clear();
-  mediaCursorSamples = null;
-  lastPcm = null;
+  timeline.reset();
   paused = true;
   stats.jitterMs = 0;
   stats.occupancyMs = 0;
@@ -787,6 +796,12 @@ function applyControl(msg) {
     // one is live so telemetry and the wire stay truthful.
     stats.source = msg.source;
     post('source', { source: msg.source });
+  } else if (msg.action === 'set-next-seq' && mode === 'guest') {
+    // Test hook: jump the send sequence close to the u32 wrap so the link's
+    // wraparound handling runs on the real encode/wire/decode path.
+    nextEncodeSeq = Number(msg.seq) >>> 0;
+    logEvent('set-next-seq', { nextEncodeSeq });
+    post('control-ack', { action: msg.action, seq: nextEncodeSeq });
   } else if (msg.action === 'set-bitrate' && mode === 'guest' && encoder) {
     const bitrate = clamp(Number(msg.bitrate) || 64000, 16000, 128000);
     encoder.configure({ codec: 'opus', sampleRate: SAMPLE_RATE, numberOfChannels: CHANNELS, bitrate });

@@ -138,7 +138,21 @@ export class TargetController {
 // concealment window. The resulting events carry the exact missing sequence
 // span, so the playout side can conceal that span and resume at the correct
 // media position instead of moving the next packet into the hole.
+//
+// Wire sequence numbers are u32 and wrap. All comparisons here are modular:
+// a packet is "behind" the cursor only when its forward distance from the
+// cursor is >= 2^31, so the wrap point itself is not a cliff. Frame events
+// carry `unwrappedSeq`, a monotonic media sequence the playout timeline can
+// multiply by the frame length without ever jumping backwards.
 // ---------------------------------------------------------------------------
+const SEQ_HALF = 0x80000000; // 2^31
+
+// Forward distance from `from` to `to` in the u32 sequence space, in
+// [0, 2^32). `>>> 0` performs the mod-2^32 reduction.
+export function seqForwardDistance(from, to) {
+  return (to - from) >>> 0;
+}
+
 export class PacketGate {
   constructor(cfg = JITTER) {
     this.cfg = cfg;
@@ -146,7 +160,8 @@ export class PacketGate {
   }
 
   reset(nextSeq = null) {
-    this.nextSeq = nextSeq;
+    this.nextSeq = nextSeq === null ? null : nextSeq >>> 0;
+    this.unwrappedNext = this.nextSeq;
     this.waitStartMs = null;
     this.pending = new Map();
     this.recentSeqs = new Uint32Array(1024);
@@ -177,10 +192,16 @@ export class PacketGate {
 
   push(seq, item, nowMs) {
     this.stats.packets++;
-    if (this.nextSeq === null) this.nextSeq = seq;
-    if (seq < this.nextSeq) {
-      // Distinguish a duplicate (re-sent, already played) from a genuinely late
-      // packet (first copy arrived after its playout deadline passed).
+    seq = seq >>> 0;
+    if (this.nextSeq === null) {
+      this.nextSeq = seq;
+      this.unwrappedNext = seq;
+    }
+    const fwd = seqForwardDistance(this.nextSeq, seq);
+    if (fwd >= SEQ_HALF) {
+      // Behind the playout cursor. Distinguish a duplicate (re-sent, already
+      // played) from a genuinely late packet (first copy arrived after its
+      // playout deadline passed).
       if (this._wasDelivered(seq)) this.stats.duplicates++;
       else this.stats.late++;
       return [];
@@ -189,7 +210,7 @@ export class PacketGate {
       this.stats.duplicates++;
       return [];
     }
-    if (seq > this.nextSeq) this.stats.reordered++;
+    if (fwd > 0) this.stats.reordered++;
     this.pending.set(seq, item);
     return this._drain(nowMs);
   }
@@ -201,9 +222,18 @@ export class PacketGate {
   _drain(nowMs) {
     const events = [];
     while (this.nextSeq !== null && !this.pending.has(this.nextSeq)) {
+      // The nearest pending packet in forward distance. Numeric order alone
+      // would pick a packet on the wrong side of the wrap.
       let nextPending = -1;
-      for (const k of this.pending.keys()) if (nextPending < 0 || k < nextPending) nextPending = k;
-      const missing = nextPending < 0 ? 1 : nextPending - this.nextSeq;
+      let bestDist = SEQ_HALF * 2;
+      for (const k of this.pending.keys()) {
+        const d = seqForwardDistance(this.nextSeq, k);
+        if (d < bestDist) {
+          bestDist = d;
+          nextPending = k;
+        }
+      }
+      const missing = nextPending < 0 ? 1 : bestDist;
 
       // A jump beyond the concealment window is a media-period discontinuity,
       // not loss. Announce it immediately; holding it would only add delay.
@@ -211,6 +241,7 @@ export class PacketGate {
         this.stats.resyncs++;
         events.push({ type: 'resync', fromSeq: this.nextSeq, toSeq: nextPending });
         this.nextSeq = nextPending;
+        this.unwrappedNext += missing;
         this.waitStartMs = null;
         continue;
       }
@@ -223,10 +254,11 @@ export class PacketGate {
       this.stats.gaps++;
       this.stats.gapFrames += missing;
       events.push({ type: 'gap', startSeq: this.nextSeq, count: missing });
-      this.nextSeq += missing;
+      this.nextSeq = (this.nextSeq + missing) >>> 0;
+      this.unwrappedNext += missing;
       this.waitStartMs = null;
       for (const k of [...this.pending.keys()]) {
-        if (k < this.nextSeq) {
+        if (seqForwardDistance(this.nextSeq, k) >= SEQ_HALF) {
           this.pending.delete(k);
           this.stats.late++;
         }
@@ -237,8 +269,9 @@ export class PacketGate {
       const item = this.pending.get(this.nextSeq);
       this.pending.delete(this.nextSeq);
       this._remember(this.nextSeq);
-      events.push({ type: 'frame', seq: this.nextSeq, item });
-      this.nextSeq++;
+      events.push({ type: 'frame', seq: this.nextSeq, unwrappedSeq: this.unwrappedNext, item });
+      this.nextSeq = (this.nextSeq + 1) >>> 0;
+      this.unwrappedNext++;
       this.waitStartMs = null;
     }
     return events;
@@ -326,6 +359,70 @@ export function classifyPlacement(mediaCursorSamples, frameMediaSample, frameSam
   if (deltaFrames > maxGapFrames) return { mode: 'rebase', deltaFrames };
   if (deltaFrames > 0) return { mode: 'conceal', deltaFrames };
   return { mode: 'place', deltaFrames: 0 };
+}
+
+// ---------------------------------------------------------------------------
+// Playout timeline. Owns the media cursor and the last played frame, and turns
+// each decoded frame into an explicit decision: where it lands, what
+// concealment (if any) precedes it, and which audio the concealment is built
+// from. Concealment always fades from the last frame that was actually
+// played — never from the post-hole frame and never from a dropped one.
+// ---------------------------------------------------------------------------
+export class PlayoutTimeline {
+  constructor(maxGapFrames = JITTER.MAX_GAP_FRAMES) {
+    this.maxGapFrames = maxGapFrames;
+    this.cursorSamples = null;
+    this.lastPcm = null;
+  }
+
+  reset() {
+    this.cursorSamples = null;
+    this.lastPcm = null;
+  }
+
+  // A media-period discontinuity: the next frame starts a fresh timeline at
+  // its own position (or, with a sample position, right after it).
+  rebase(mediaSample = null) {
+    this.cursorSamples = mediaSample;
+    this.lastPcm = null;
+  }
+
+  // Decide where a decoded frame belongs. Returns one of:
+  //   { mode: 'epoch'|'place', at }            write the frame at `at`
+  //   { mode: 'conceal', at, concealFrames, concealPcm }  conceal exactly
+  //                                           `concealFrames`, then write the
+  //                                           frame at its own position
+  //   { mode: 'rebase', deltaFrames }         discontinuity; caller rebases
+  //   { mode: 'drop', deltaFrames }           overlap; never rewinds
+  // `at` is the media-cursor position at which the frame itself is written.
+  accept(mediaSample, pcm) {
+    const frames = pcm.length;
+    if (this.cursorSamples === null) {
+      const at = mediaSample;
+      this.cursorSamples = mediaSample + frames;
+      this.lastPcm = pcm;
+      return { mode: 'epoch', at };
+    }
+    const placement = classifyPlacement(this.cursorSamples, mediaSample, frames, this.maxGapFrames);
+    if (placement.mode === 'rebase') {
+      this.rebase(mediaSample);
+      return { mode: 'rebase', deltaFrames: placement.deltaFrames };
+    }
+    if (placement.mode === 'drop') {
+      // Dropped audio was never played: it must not become the concealment
+      // source, and the cursor must not move.
+      return { mode: 'drop', deltaFrames: placement.deltaFrames };
+    }
+    let concealPcm = null;
+    if (placement.mode === 'conceal') {
+      concealPcm = concealmentSpan(this.lastPcm, placement.deltaFrames, frames);
+      this.cursorSamples += placement.deltaFrames * frames;
+    }
+    const at = this.cursorSamples;
+    this.cursorSamples += frames;
+    this.lastPcm = pcm;
+    return { mode: placement.mode, at, concealFrames: placement.deltaFrames, concealPcm };
+  }
 }
 
 export function samplesToMsFloat(samples) {

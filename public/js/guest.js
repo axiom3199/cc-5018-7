@@ -37,6 +37,10 @@ let running = false;
 let profile = { ...NETWORK_PROFILES.steady };
 let lastE2e = null;
 
+// Control probe for the end-to-end timing regression (mirrors the host
+// page's probes): lets a test drive real kernel controls, never a mock.
+window.__guestControl = (action, extra = {}) => client?.control(action, extra);
+
 function boot() {
   const isolated = self.crossOriginIsolated;
   ui.dotCrypto.className = `dot ${isolated ? 'ok' : 'bad'}`;
